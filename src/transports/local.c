@@ -290,50 +290,6 @@ static int local_negotiate_fetch(
 	return 0;
 }
 
-static int local_push_copy_object(
-	git_odb *local_odb,
-	git_odb *remote_odb,
-	git_pobject *obj)
-{
-	int error = 0;
-	git_odb_object *odb_obj = NULL;
-	git_odb_stream *odb_stream;
-	size_t odb_obj_size;
-	git_otype odb_obj_type;
-	git_oid remote_odb_obj_oid;
-
-	/* Object already exists in the remote ODB; do nothing and return 0*/
-	if (git_odb_exists(remote_odb, &obj->id))
-		return 0;
-
-	if ((error = git_odb_read(&odb_obj, local_odb, &obj->id)) < 0)
-		return error;
-
-	odb_obj_size = git_odb_object_size(odb_obj);
-	odb_obj_type = git_odb_object_type(odb_obj);
-
-	if ((error = git_odb_open_wstream(&odb_stream, remote_odb,
-		odb_obj_size, odb_obj_type)) < 0)
-		goto on_error;
-
-	if (git_odb_stream_write(odb_stream, (char *)git_odb_object_data(odb_obj),
-		odb_obj_size) < 0 ||
-		git_odb_stream_finalize_write(&remote_odb_obj_oid, odb_stream) < 0) {
-		error = -1;
-	} else if (git_oid__cmp(&obj->id, &remote_odb_obj_oid) != 0) {
-		giterr_set(GITERR_ODB, "Error when writing object to remote odb "
-			"during local push operation. Remote odb object oid does not "
-			"match local oid.");
-		error = -1;
-	}
-
-	git_odb_stream_free(odb_stream);
-
-on_error:
-	git_odb_object_free(odb_obj);
-	return error;
-}
-
 static int local_push_update_remote_ref(
 	git_repository *remote_repo,
 	const char *lref,
@@ -364,20 +320,28 @@ static int local_push_update_remote_ref(
 	return error;
 }
 
+static int transfer_to_push_transfer(const git_transfer_progress *stats, void *payload)
+{
+	git_push *push = payload;
+
+	if (!push->transfer_progress_cb)
+		return 0;
+
+	return push->transfer_progress_cb(stats->received_objects, stats->total_objects, stats->received_bytes,
+					  push->transfer_progress_cb_payload);
+}
+
 static int local_push(
 	git_transport *transport,
 	git_push *push)
 {
 	transport_local *t = (transport_local *)transport;
-	git_odb *remote_odb = NULL;
-	git_odb *local_odb = NULL;
 	git_repository *remote_repo = NULL;
 	push_spec *spec;
 	char *url = NULL;
 	const char *path;
-	git_buf buf = GIT_BUF_INIT;
+	git_buf buf = GIT_BUF_INIT, odb_path = GIT_BUF_INIT;
 	int error;
-	unsigned int i;
 	size_t j;
 
 	/* 'push->remote->url' may be a url or path; convert to a path */
@@ -406,15 +370,14 @@ static int local_push(
 		goto on_error;
 	}
 
-	if ((error = git_repository_odb__weakptr(&remote_odb, remote_repo)) < 0 ||
-		(error = git_repository_odb__weakptr(&local_odb, push->repo)) < 0)
+	if ((error = git_buf_joinpath(&odb_path, git_repository_path(remote_repo), "objects/pack")) < 0)
 		goto on_error;
 
-	for (i = 0; i < push->pb->nr_objects; i++) {
-		if ((error = local_push_copy_object(local_odb, remote_odb,
-			&push->pb->object_list[i])) < 0)
-			goto on_error;
-	}
+	error = git_packbuilder_write(push->pb, odb_path.ptr, 0, transfer_to_push_transfer, push);
+	git_buf_free(&odb_path);
+
+	if (error < 0)
+		goto on_error;
 
 	push->unpack_ok = 1;
 
